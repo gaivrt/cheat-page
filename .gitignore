@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+venv/
+ENV/
+dist/
+build/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Project specific
+window_position.json
