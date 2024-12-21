@@ -20,12 +20,35 @@ import win32con
 import win32api
 import ctypes
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import base64
 from io import BytesIO
+import base64
+from pystray import Icon as TrayIcon, Menu as TrayMenu, MenuItem as TrayMenuItem
+
+# 加载环境变量
+load_dotenv()
+
+# 模型选择
+MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai").lower()
 
 # 代理配置
-PROXY_URL = "http://127.0.0.1:10809"  # 改用 HTTP 代理，通常 Clash 的 HTTP 代理端口是 7890
+PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:10809")
+
+# OpenAI配置
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4-vision-preview")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "500"))
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
+OPENAI_TOP_P = float(os.getenv("OPENAI_TOP_P", "1.0"))
+OPENAI_PRESENCE_PENALTY = float(os.getenv("OPENAI_PRESENCE_PENALTY", "0.0"))
+OPENAI_FREQUENCY_PENALTY = float(os.getenv("OPENAI_FREQUENCY_PENALTY", "0.0"))
+
+# Gemini配置
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro-vision")
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
+GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.8"))
+GEMINI_TOP_K = int(os.getenv("GEMINI_TOP_K", "40"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
 
 # 配置 Google API 使用代理
 os.environ['HTTPS_PROXY'] = PROXY_URL
@@ -33,9 +56,6 @@ os.environ['HTTP_PROXY'] = PROXY_URL
 
 # 禁用SSL警告
 urllib3.disable_warnings()
-
-# 加载环境变量
-load_dotenv()
 
 class ScreenshotSelector(tk.Toplevel):
     def __init__(self, callback, cancel_callback):
@@ -75,12 +95,12 @@ class ScreenshotSelector(tk.Toplevel):
         self.withdraw()
         
         # 配置根窗口
+        self.attributes('-alpha', 0.01)  # 设置窗口几乎完全透明
         self.configure(bg='black')
+        self.attributes('-topmost', True)  # 确保窗口始终在最顶层
         
         # 设置窗口属性
         self.overrideredirect(True)
-        self.attributes('-alpha', 0.01)  # 设置为几乎全透明
-        self.attributes('-topmost', True)
         
         # 设置窗口大小和位置
         self.geometry(f"{self.screen_width}x{self.screen_height}+0+0")
@@ -320,18 +340,164 @@ class ScreenshotSelector(tk.Toplevel):
 
 class FloatingWindow:
     def __init__(self):
-        # 初始化计时相关变量
-        self.start_time = None
-        self.loading_timer = None
+        self.popup = None
+        self.screenshot = None
         self.hide_timer = None
+        self.is_processing = False  # 添加处理状态标志
         
         # 先创建窗口
         self.setup_window()
         self.setup_hotkey()
-        self.is_processing = False
+        
+        # 当前选择的模型配置
+        self.current_model_provider = MODEL_PROVIDER
+        self.current_model = OPENAI_MODEL if MODEL_PROVIDER == "openai" else GEMINI_MODEL
+        
+        # 保存环境变量的原始值
+        self.original_env = {
+            "MODEL_PROVIDER": MODEL_PROVIDER,
+            "OPENAI_MODEL": OPENAI_MODEL,
+            "GEMINI_MODEL": GEMINI_MODEL
+        }
+        
+        # 设置系统托盘
+        self.setup_tray()
         
         # 直接加载模型
         threading.Thread(target=self.setup_gemini, daemon=True).start()
+
+    def get_model_menu(self, provider, models):
+        return TrayMenu(*[
+            TrayMenuItem(
+                f"{model} {'✓' if self.current_model_provider == provider and self.current_model == model else ''}",
+                lambda item, model=model: self.switch_model(provider, str(model))  # 确保model是字符串
+            ) for model in models
+        ])
+
+    def create_tray_icon(self):
+        """创建系统托盘图标"""
+        # 创建一个简单的图标
+        icon_size = 64
+        icon_image = Image.new('RGBA', (icon_size, icon_size), color=(255, 255, 255, 0))
+        draw = ImageDraw.Draw(icon_image)
+        
+        # 绘制圆形背景
+        draw.ellipse([2, 2, icon_size-3, icon_size-3], fill='white', outline='black', width=2)
+        
+        # 添加文字
+        try:
+            # 尝试使用微软雅黑字体
+            from PIL import ImageFont
+            font = ImageFont.truetype("msyh.ttc", 24)
+        except:
+            font = None
+        
+        # 计算文字位置使其居中
+        text = "AI"
+        if font:
+            text_bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+        else:
+            text_width = 20
+            text_height = 20
+        
+        x = (icon_size - text_width) // 2
+        y = (icon_size - text_height) // 2
+        
+        # 绘制文字
+        draw.text((x, y), text, fill='black', font=font)
+        
+        def create_menu():
+            """创建右键菜单"""
+            openai_models = [
+                "gpt-4-vision-preview",
+                "gpt-4o",
+                "o1-mini"
+            ]
+            
+            gemini_models = [
+                "gemini-pro-vision",
+                "gemini-2.0-flash-thinking-exp-1219"
+            ]
+
+            return TrayMenu(
+                TrayMenuItem(
+                    "OpenAI Models",
+                    self.get_model_menu("openai", openai_models)
+                ),
+                TrayMenuItem(
+                    "Gemini Models",
+                    self.get_model_menu("gemini", gemini_models)
+                ),
+                TrayMenu.SEPARATOR,
+                TrayMenuItem(
+                    "退出",
+                    lambda: self.quit_app()
+                )
+            )
+
+        # 创建系统托盘图标
+        self.tray_icon = TrayIcon(
+            "AI Assistant",
+            icon_image,
+            "AI Assistant",
+            create_menu()
+        )
+
+    def switch_model(self, provider, model):
+        """切换模型"""
+        try:
+            print(f"\n切换到 {provider} 的 {model} 模型")
+            
+            # 更新当前选择
+            self.current_model_provider = provider
+            self.current_model = model
+            
+            # 更新环境变量
+            os.environ["MODEL_PROVIDER"] = str(provider)
+            if provider == "openai":
+                os.environ["OPENAI_MODEL"] = str(model)
+            else:
+                os.environ["GEMINI_MODEL"] = str(model)
+                
+            # 停止当前托盘图标
+            self.tray_icon.stop()
+            
+            # 重新创建托盘图标
+            self.create_tray_icon()
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+            
+            # 显示提示
+            self.show_result(f"已切换到 {provider} 的 {model} 模型")
+            
+        except Exception as e:
+            print(f"切换模型时出错: {str(e)}")
+            self.show_result(f"切换模型失败: {str(e)}")
+
+    def setup_tray(self):
+        """设置系统托盘"""
+        self.create_tray_icon()
+        # 在新线程中运行托盘图标
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def quit_app(self, icon=None):
+        """退出应用"""
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
+        # 取消注册所有快捷键
+        keyboard.unhook_all()
+        # 还原环境变量
+        os.environ["MODEL_PROVIDER"] = self.original_env["MODEL_PROVIDER"]
+        os.environ["OPENAI_MODEL"] = self.original_env["OPENAI_MODEL"]
+        os.environ["GEMINI_MODEL"] = self.original_env["GEMINI_MODEL"]
+        # 销毁所有窗口
+        if hasattr(self, 'popup') and self.popup:
+            self.popup.destroy()
+        if hasattr(self, 'root') and self.root:
+            self.root.destroy()
+        # 强制退出
+        os._exit(0)
 
     def setup_gemini(self):
         """设置和加载Gemini模型"""
@@ -344,10 +510,10 @@ class FloatingWindow:
             
             # 设置生成参数
             generation_config = {
-                "temperature": 0.4,
-                "top_p": 1,
-                "top_k": 32,
-                "max_output_tokens": 4096,
+                "temperature": GEMINI_TEMPERATURE,
+                "top_p": GEMINI_TOP_P,
+                "top_k": GEMINI_TOP_K,
+                "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
             }
             
             # 设置安全设置
@@ -498,92 +664,178 @@ class FloatingWindow:
     def analyze_image(self, image_path):
         """分析图片内容"""
         try:
-            # 打开图片
-            img = Image.open(image_path)
+            print("\n=== 开始分析图片 ===")
+            print(f"使用模型提供商: {MODEL_PROVIDER}")
             
-            # 准备提示词
-            prompt = """
-            You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one.
-            """
-            
-            # 发送请求
-            response = self.model.generate_content([prompt, img])
-            
-            # 只显示 parts[1] 的内容
-            if response.candidates and response.candidates[0].content.parts:
-                try:
-                    # 尝试获取 parts[1] 的内容
-                    result = response.candidates[0].content.parts[1].text
-                except IndexError:
-                    # 如果没有 parts[1]，则使用最后一个 part 的内容
-                    result = response.candidates[0].content.parts[0].text
-                
-                self.show_result(result.strip())
+            # 根据配置选择使用哪个模型
+            if MODEL_PROVIDER == "openai":
+                return self._analyze_with_openai(image_path)
+            elif MODEL_PROVIDER == "gemini":
+                return self._analyze_with_gemini(image_path)
             else:
-                self.show_result("无法获取答案")
-                
-        except Exception as e:
-            error_msg = f"分析图片时出错:\n{str(e)}"
-            print(error_msg)
-            self.show_result(error_msg)
-        finally:
-            try:
-                os.unlink(image_path)
-            except Exception:
-                pass
+                error_msg = f"未知的模型提供商: {MODEL_PROVIDER}，请在 .env 文件中设置 MODEL_PROVIDER 为 'openai' 或 'gemini'"
+                print(error_msg)
+                self.show_result(error_msg)
+                return error_msg
 
-    def test_proxy(self):
+        except Exception as e:
+            print(f"图片分析失败: {str(e)}")
+            print(f"异常类型: {type(e).__name__}")
+            error_msg = "图片分析失败，请重试"
+            self.show_result(error_msg)
+            return error_msg
+
+    def _analyze_with_openai(self, image_path):
+        """使用OpenAI API分析图片"""
         try:
-            print(f"正在测试代理 {PROXY_URL}...")
+            print("\n=== 使用OpenAI API ===")
+            print(f"使用的API基础URL: {OPENAI_API_BASE}")
+            print(f"代理设置: {PROXY_URL}")
             
-            # 使用更长的超时时间
-            timeout = httpx.Timeout(30.0, connect=30.0)
-            
-            with httpx.Client(
-                proxies={"all://": PROXY_URL},
-                timeout=timeout,
-                verify=False,  # 禁用SSL验证
-                follow_redirects=True
-            ) as client:
-                # 测试连接到 Google AI Studio
-                print("测试连接到 Google AI Studio...")
-                response = client.get('https://aistudio.google.com/')
-                if response.status_code == 200:
-                    print("成功连接到 Google AI Studio!")
+            with open(image_path, "rb") as image_file:
+                print("正在读取图片并转换为base64...")
+                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {OPENAI_API_KEY}"
+                }
+                print("API请求头:", {k: v if k != 'Authorization' else '***' for k, v in headers.items()})
+                
+                print("正在准备发送API请求...")
+                print(f"请求URL: {OPENAI_API_BASE}/chat/completions")
+                print(f"使用模型: {OPENAI_MODEL}")
+                print(f"参数配置:")
+                print(f"- 最大tokens: {OPENAI_MAX_TOKENS}")
+                print(f"- 温度: {OPENAI_TEMPERATURE}")
+                print(f"- top_p: {OPENAI_TOP_P}")
+                print(f"- presence_penalty: {OPENAI_PRESENCE_PENALTY}")
+                print(f"- frequency_penalty: {OPENAI_FREQUENCY_PENALTY}")
+                
+                # 基础payload
+                payload = {
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_data}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "temperature": OPENAI_TEMPERATURE,
+                    "top_p": OPENAI_TOP_P,
+                    "presence_penalty": OPENAI_PRESENCE_PENALTY,
+                    "frequency_penalty": OPENAI_FREQUENCY_PENALTY
+                }
+                
+                # 根据模型类型添加不同的token限制参数
+                if OPENAI_MODEL.startswith("o1-"):
+                    payload["max_completion_tokens"] = OPENAI_MAX_TOKENS
                 else:
-                    print(f"连接返回状态码: {response.status_code}")
+                    payload["max_tokens"] = OPENAI_MAX_TOKENS
                 
-                print("测试获取IP信息...")
-                response = client.get('https://api.ipify.org?format=json')
-                ip_info = response.json()
-                success_msg = f"代理测试成功！\n当前IP: {ip_info['ip']}\nGoogle AI Studio 可访问\n代理服务器: {PROXY_URL}"
-                print(success_msg)
-                self.show_result(success_msg)
-                
-        except httpx.TimeoutException:
-            error_msg = f"代理连接超时\n请检查:\n1. 代理服务器 {PROXY_URL} 是否在运行\n2. 防火墙设置\n3. 代理服务器是否支持HTTP"
-            print(error_msg)
-            self.show_result(error_msg)
-        except httpx.ConnectError:
-            error_msg = f"无法连接到代理服务器\n请检查代理服务器 {PROXY_URL} 是否正确"
-            print(error_msg)
-            self.show_result(error_msg)
+                try:
+                    print("发送API请求中...")
+                    client = httpx.Client(
+                        verify=False,
+                        proxies={
+                            "http://": PROXY_URL,
+                            "https://": PROXY_URL
+                        } if PROXY_URL else None,
+                        timeout=30
+                    )
+                    response = client.post(
+                        f"{OPENAI_API_BASE}/chat/completions",
+                        headers=headers,
+                        json=payload
+                    )
+                    
+                    print(f"API响应状态码: {response.status_code}")
+                    if response.status_code == 200:
+                        result = response.json()
+                        print("API请求成功！")
+                        print("API响应:", result)
+                        response_text = result['choices'][0]['message']['content']
+                        print("分析结果:", response_text)
+                        self.show_result(response_text)
+                        return response_text
+                    else:
+                        print(f"API请求失败: {response.status_code}")
+                        print("错误响应:", response.text)
+                        raise Exception(f"API请求失败: {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"API请求异常: {str(e)}")
+                    print(f"异常类型: {type(e).__name__}")
+                    if isinstance(e, httpx.TimeoutException):
+                        print("请求超时，可能是网络问题或代理设置有误")
+                    elif isinstance(e, httpx.ConnectError):
+                        print("连接错误，请检查网络连接和代理设置")
+                    raise
+                finally:
+                    client.close()
+                    
         except Exception as e:
-            error_msg = f"代理测试失败: {str(e)}"
-            print(error_msg)
-            self.show_result(error_msg)
+            print(f"OpenAI分析失败: {str(e)}")
+            print(f"异常类型: {type(e).__name__}")
+            raise
 
-    def quit_app(self):
-        # 取消注册所有快捷键
-        keyboard.unhook_all()
-        # 销毁所有窗口
-        self.popup.destroy()
-        self.root.destroy()
-        # 强制退出
-        os._exit(0)
+    def _analyze_with_gemini(self, image_path):
+        """使用Gemini API分析图片（作为备用）"""
+        try:
+            print("\n=== 使用Gemini API ===")
+            print("正在加载图片...")
+            image = Image.open(image_path)
+            
+            print("正在初始化Gemini模型...")
+            print(f"使用模型: {GEMINI_MODEL}")
+            print(f"参数配置:")
+            print(f"- 温度: {GEMINI_TEMPERATURE}")
+            print(f"- top_p: {GEMINI_TOP_P}")
+            print(f"- top_k: {GEMINI_TOP_K}")
+            print(f"- 最大输出tokens: {GEMINI_MAX_OUTPUT_TOKENS}")
+            
+            model = genai.GenerativeModel(
+                GEMINI_MODEL,
+                generation_config={
+                    "temperature": GEMINI_TEMPERATURE,
+                    "top_p": GEMINI_TOP_P,
+                    "top_k": GEMINI_TOP_K,
+                    "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
+                }
+            )
+            
+            print("发送Gemini API请求...")
+            response = model.generate_content(["You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one.", image])
+            
+            # 根据模型类型处理响应
+            if GEMINI_MODEL == "gemini-2.0-flash-thinking-exp-1219":
+                result = response.candidates[0].content.parts[1].text
+            else:
+                result = response.text
+                
+            print("Gemini分析结果:", result)
+            self.show_result(result)
+            return result
+        except Exception as e:
+            print(f"Gemini分析失败: {str(e)}")
+            print(f"异常类型: {type(e).__name__}")
+            error_msg = "图片分析失败，请重试"
+            self.show_result(error_msg)
+            return error_msg
 
     def run(self):
-        print("程序已启动！使用Ctrl+Shift+Q截图，Ctrl+Shift+T测试代理，Ctrl+C退出")
+        print("程序已启动！使用Ctrl+Shift+Q截图，Ctrl+C退出")
         try:
             self.root.mainloop()
         except Exception as e:
@@ -594,8 +846,6 @@ class FloatingWindow:
 
     def setup_hotkey(self):
         keyboard.add_hotkey('ctrl+shift+q', self.take_screenshot)
-        # 添加代理测试快捷键
-        keyboard.add_hotkey('ctrl+shift+t', self.test_proxy)
         keyboard.add_hotkey('ctrl+c', self.quit_app)
 
     def setup_window(self):
@@ -724,113 +974,12 @@ class FloatingWindow:
         """当内容框架大小改变时，更新Canvas的滚动区域"""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-class APIHandler(BaseHTTPRequestHandler):
-    def _send_response(self, status_code, data):
-        self.send_response(status_code)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def do_POST(self):
-        if self.path == '/v1/chat/completions':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            request_data = json.loads(post_data.decode())
-
-            # 检查是否包含图像
-            messages = request_data.get('messages', [])
-            image_content = None
-            prompt = ""
-
-            for message in messages:
-                if message.get('role') == 'user':
-                    content = message.get('content', [])
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict):
-                                if item.get('type') == 'text':
-                                    prompt += item.get('text', '')
-                                elif item.get('type') == 'image_url':
-                                    image_url = item.get('image_url', {}).get('url', '')
-                                    if image_url.startswith('data:image'):
-                                        # 处理base64图像
-                                        image_data = image_url.split(',')[1]
-                                        image_content = base64.b64decode(image_data)
-                    else:
-                        prompt += str(content)
-
-            if image_content:
-                # 保存图像到临时文件
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
-                    temp_file.write(image_content)
-                    temp_path = temp_file.name
-
-                try:
-                    # 使用现有的Gemini分析功能
-                    image = Image.open(temp_path)
-                    app = FloatingWindow()
-                    result = app.analyze_image(temp_path)
-
-                    # 构造OpenAI格式的响应
-                    response_data = {
-                        'id': 'chatcmpl-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S'),
-                        'object': 'chat.completion',
-                        'created': int(time.time()),
-                        'model': 'gpt-4-vision-preview',
-                        'usage': {
-                            'prompt_tokens': 0,
-                            'completion_tokens': 0,
-                            'total_tokens': 0
-                        },
-                        'choices': [
-                            {
-                                'message': {
-                                    'role': 'assistant',
-                                    'content': result
-                                },
-                                'finish_reason': 'stop',
-                                'index': 0
-                            }
-                        ]
-                    }
-
-                    self._send_response(200, response_data)
-
-                finally:
-                    # 清理临时文件
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-            else:
-                self._send_response(400, {'error': 'No image found in request'})
-        else:
-            self._send_response(404, {'error': 'Not found'})
-
-class APIServer:
-    def __init__(self, port=8000):
-        self.port = port
-        self.server = None
-
-    def start(self):
-        self.server = HTTPServer(('localhost', self.port), APIHandler)
-        print(f"API server started on port {self.port}")
-        self.server.serve_forever()
-
-    def stop(self):
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-
 if __name__ == '__main__':
     app = FloatingWindow()
-    
-    # 启动API服务器
-    api_server = APIServer(port=8000)
-    api_thread = threading.Thread(target=api_server.start, daemon=True)
-    api_thread.start()
-    
     try:
         app.run()
-    finally:
-        api_server.stop()
+    except KeyboardInterrupt:
+        app.quit_app()
+    except Exception as e:
+        print(f"程序异常退出: {e}")
+        os._exit(1)
