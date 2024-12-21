@@ -19,6 +19,10 @@ import win32ui
 import win32con
 import win32api
 import ctypes
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import base64
+from io import BytesIO
 
 # 代理配置
 PROXY_URL = "http://127.0.0.1:10809"  # 改用 HTTP 代理，通常 Clash 的 HTTP 代理端口是 7890
@@ -720,12 +724,113 @@ class FloatingWindow:
         """当内容框架大小改变时，更新Canvas的滚动区域"""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
+class APIHandler(BaseHTTPRequestHandler):
+    def _send_response(self, status_code, data):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def do_POST(self):
+        if self.path == '/v1/chat/completions':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            request_data = json.loads(post_data.decode())
+
+            # 检查是否包含图像
+            messages = request_data.get('messages', [])
+            image_content = None
+            prompt = ""
+
+            for message in messages:
+                if message.get('role') == 'user':
+                    content = message.get('content', [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                if item.get('type') == 'text':
+                                    prompt += item.get('text', '')
+                                elif item.get('type') == 'image_url':
+                                    image_url = item.get('image_url', {}).get('url', '')
+                                    if image_url.startswith('data:image'):
+                                        # 处理base64图像
+                                        image_data = image_url.split(',')[1]
+                                        image_content = base64.b64decode(image_data)
+                    else:
+                        prompt += str(content)
+
+            if image_content:
+                # 保存图像到临时文件
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+                    temp_file.write(image_content)
+                    temp_path = temp_file.name
+
+                try:
+                    # 使用现有的Gemini分析功能
+                    image = Image.open(temp_path)
+                    app = FloatingWindow()
+                    result = app.analyze_image(temp_path)
+
+                    # 构造OpenAI格式的响应
+                    response_data = {
+                        'id': 'chatcmpl-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S'),
+                        'object': 'chat.completion',
+                        'created': int(time.time()),
+                        'model': 'gpt-4-vision-preview',
+                        'usage': {
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0,
+                            'total_tokens': 0
+                        },
+                        'choices': [
+                            {
+                                'message': {
+                                    'role': 'assistant',
+                                    'content': result
+                                },
+                                'finish_reason': 'stop',
+                                'index': 0
+                            }
+                        ]
+                    }
+
+                    self._send_response(200, response_data)
+
+                finally:
+                    # 清理临时文件
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+            else:
+                self._send_response(400, {'error': 'No image found in request'})
+        else:
+            self._send_response(404, {'error': 'Not found'})
+
+class APIServer:
+    def __init__(self, port=8000):
+        self.port = port
+        self.server = None
+
+    def start(self):
+        self.server = HTTPServer(('localhost', self.port), APIHandler)
+        print(f"API server started on port {self.port}")
+        self.server.serve_forever()
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+
 if __name__ == '__main__':
     app = FloatingWindow()
+    
+    # 启动API服务器
+    api_server = APIServer(port=8000)
+    api_thread = threading.Thread(target=api_server.start, daemon=True)
+    api_thread.start()
+    
     try:
         app.run()
-    except KeyboardInterrupt:
-        app.quit_app()
-    except Exception as e:
-        print(f"程序异常退出: {e}")
-        os._exit(1)
+    finally:
+        api_server.stop()
