@@ -22,7 +22,6 @@ import ctypes
 import json
 from io import BytesIO
 import base64
-from pystray import Icon as TrayIcon, Menu as TrayMenu, MenuItem as TrayMenuItem
 
 # 加载环境变量
 load_dotenv()
@@ -360,9 +359,6 @@ class FloatingWindow:
             "GEMINI_MODEL": GEMINI_MODEL
         }
         
-        # 设置系统托盘
-        self.setup_tray()
-        
         # 直接加载模型
         threading.Thread(target=self.setup_gemini, daemon=True).start()
 
@@ -483,8 +479,6 @@ class FloatingWindow:
 
     def quit_app(self, icon=None):
         """退出应用"""
-        if hasattr(self, 'tray_icon'):
-            self.tray_icon.stop()
         # 取消注册所有快捷键
         keyboard.unhook_all()
         # 还原环境变量
@@ -819,7 +813,7 @@ class FloatingWindow:
             response = model.generate_content(["You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one.", image])
             
             # 根据模型类型处理响应
-            if GEMINI_MODEL == "gemini-2.0-flash-thinking-exp-1219":
+            if GEMINI_MODEL == "gemini-2.0-flash-thinking-exp":
                 result = response.candidates[0].content.parts[1].text
             else:
                 result = response.text
