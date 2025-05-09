@@ -2,6 +2,7 @@ import os
 import sys
 import keyboard
 import google.generativeai as genai
+# from google.generativeai.types import Part # 新增导入 for Gemini history <-- 将被移除
 from PIL import Image, ImageGrab
 import tempfile
 from dotenv import load_dotenv
@@ -345,6 +346,8 @@ class FloatingWindow:
         self.screenshot = None
         self.hide_timer = None
         self.is_processing = False  # 添加处理状态标志
+        self.chat_history = [] # 新增：存储聊天历史
+        self.current_analysis_is_new_task = True # 新增：标记是否为新任务
         
         # 先创建窗口
         self.setup_window()
@@ -467,11 +470,11 @@ class FloatingWindow:
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
             
             # 显示提示
-            self.show_result(f"已切换到 {provider} 的 {model} 模型")
+            self.show_result(f"已切换到 {provider} 的 {model} 模型", copy_to_clipboard=False)
             
         except Exception as e:
             print(f"切换模型时出错: {str(e)}")
-            self.show_result(f"切换模型失败: {str(e)}")
+            self.show_result(f"切换模型失败: {str(e)}", copy_to_clipboard=False)
 
     def setup_tray(self):
         """设置系统托盘"""
@@ -496,6 +499,12 @@ class FloatingWindow:
             self.root.destroy()
         # 强制退出
         os._exit(0)
+
+    def clear_chat_history(self):
+        """清空聊天历史"""
+        self.chat_history = []
+        print("聊天历史已清除。")
+        self.show_result("聊天历史已清除。下一次截图将开始新的对话。", copy_to_clipboard=False)
 
     def setup_gemini(self):
         """设置和加载Gemini模型"""
@@ -544,7 +553,11 @@ class FloatingWindow:
         except Exception as e:
             error_msg = f"设置Gemini时出错:\n{str(e)}"
             print(error_msg)
-            self.root.after(0, lambda: self.show_result(error_msg))
+            # 确保 root 存在才调用 after
+            if hasattr(self, 'root') and self.root:
+                self.root.after(0, lambda: self.show_result(error_msg, copy_to_clipboard=False))
+            else:
+                print("Root window not available for Gemini setup error display.")
 
     def cancel_auto_hide(self):
         if self.hide_timer:
@@ -572,88 +585,115 @@ class FloatingWindow:
             self.popup.withdraw()
             self.cancel_auto_hide()
 
-    def show_result(self, text):
-        try:
-            pyperclip.copy(text)
-            print(f"已使用 pyperclip 复制到剪贴板: {text}")
-        except pyperclip.PyperclipException as e_pyperclip:
-            print(f"使用 pyperclip 复制到剪贴板失败: {e_pyperclip}")
-            print("请确保您已安装 xclip 或 xsel (Linux) 或正确配置剪贴板。")
-            print("尝试使用 Tkinter 的剪贴板功能作为后备。")
-            try: 
-                self.root.clipboard_clear()
-                self.root.clipboard_append(text)
-                self.root.update()
-                print(f"已使用 Tkinter 复制到剪贴板: {text}")
-            except Exception as e_tk:
-                print(f"使用 Tkinter 复制到剪贴板失败: {e_tk}")
-                print(f"原始文本: {text}")
-        except Exception as e: # 其他未知错误
-            print(f"复制到剪贴板时发生未知错误: {e}")
-            print(f"原始文本: {text}")
-        
+    def show_result(self, text, copy_to_clipboard=True):
+        """处理结果文本，选择性复制到剪贴板。"""
+        if copy_to_clipboard:
+            try:
+                pyperclip.copy(text)
+                print(f"已将AI输出复制到剪贴板: {text}")
+            except pyperclip.PyperclipException as e_pyperclip:
+                print(f"使用 pyperclip 复制AI输出到剪贴板失败: {e_pyperclip}")
+                print("请确保您已安装 xclip 或 xsel (Linux) 或正确配置剪贴板。")
+                print("尝试使用 Tkinter 的剪贴板功能作为后备。")
+                try: 
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(text)
+                    self.root.update()
+                    print(f"已使用 Tkinter 将AI输出复制到剪贴板: {text}")
+                except Exception as e_tk:
+                    print(f"使用 Tkinter 复制AI输出到剪贴板失败: {e_tk}")
+                    print(f"原始AI输出 (未能复制): {text}")
+            except Exception as e: # 其他未知错误
+                print(f"复制AI输出到剪贴板时发生未知错误: {e}")
+                print(f"原始AI输出 (未能复制): {text}")
+        else:
+            # 如果不复制到剪贴板，仍然打印到控制台作为提示/错误
+            print(f"提示/错误 (未复制到剪贴板): {text}")
+
     def take_screenshot(self):
         if self.is_processing:
-            self.show_result("正在处理上一个请求，请稍后再试...")
+            self.show_result("正在处理上一个请求，请稍后再试...", copy_to_clipboard=False)
             return
             
+        self.current_analysis_is_new_task = True
         try:
-            # 先隐藏弹窗
             if hasattr(self, 'popup') and self.popup.winfo_ismapped():
                 self.popup.withdraw()
-                
             self.is_processing = True
             selector = ScreenshotSelector(self.process_screenshot, self.cancel_screenshot)
         except Exception as e:
             print(f"截图错误: {e}")
             self.is_processing = False
+            self.show_result(f"截图启动错误: {e}", copy_to_clipboard=False)
+
+    def take_screenshot_with_history(self):
+        """截图并结合历史进行分析"""
+        if self.is_processing:
+            self.show_result("正在处理上一个请求，请稍后再试...", copy_to_clipboard=False)
+            return
+        self.current_analysis_is_new_task = False
+        try:
+            if hasattr(self, 'popup') and self.popup.winfo_ismapped():
+                self.popup.withdraw()
+            self.is_processing = True
+            selector = ScreenshotSelector(self.process_screenshot, self.cancel_screenshot)
+        except Exception as e:
+            print(f"带历史截图错误: {e}")
+            self.is_processing = False
+            self.show_result(f"带历史截图启动错误: {e}", copy_to_clipboard=False)
 
     def cancel_screenshot(self):
         print("截图已取消")
         self.is_processing = False
+        self.show_result("截图已取消。", copy_to_clipboard=False)
 
     def process_screenshot(self, screenshot):
         try:
-            # 显示截图区域信息
+            if self.current_analysis_is_new_task:
+                self.clear_chat_history() # clear_chat_history 内部的 show_result 会设为不复制
+
             width, height = screenshot.size
-            self.show_result(f"已截取区域：{width}x{height}像素\n正在分析图片...")
+            processing_message = f"已截取区域：{width}x{height}像素\n正在分析图片..."
+            if not self.current_analysis_is_new_task and self.chat_history:
+                processing_message += "\n(结合上下文中...)"
+            self.show_result(processing_message, copy_to_clipboard=False)
             
-            # 创建临时文件用于分析
             with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
                 screenshot.save(tmp_file.name)
-                # 分析图片
-                self.analyze_image(tmp_file.name)
+                self.analyze_image(tmp_file.name, self.chat_history)
         
         except Exception as e:
-            self.show_result(f"截图过程出错：{str(e)}")
+            self.show_result(f"截图过程出错：{str(e)}", copy_to_clipboard=False)
         finally:
             self.is_processing = False
 
-    def analyze_image(self, image_path):
+    def analyze_image(self, image_path, chat_history_to_use):
         """分析图片内容"""
         try:
             print("\n=== 开始分析图片 ===")
             print(f"使用模型提供商: {MODEL_PROVIDER}")
+            print(f"是否为新任务: {self.current_analysis_is_new_task}")
+            print(f"当前历史记录条数: {len(chat_history_to_use)}")
             
             # 根据配置选择使用哪个模型
             if MODEL_PROVIDER == "openai":
-                return self._analyze_with_openai(image_path)
+                return self._analyze_with_openai(image_path, chat_history_to_use)
             elif MODEL_PROVIDER == "gemini":
-                return self._analyze_with_gemini(image_path)
+                return self._analyze_with_gemini(image_path, chat_history_to_use)
             else:
                 error_msg = f"未知的模型提供商: {MODEL_PROVIDER}，请在 .env 文件中设置 MODEL_PROVIDER 为 'openai' 或 'gemini'"
                 print(error_msg)
-                self.show_result(error_msg)
+                self.show_result(error_msg, copy_to_clipboard=False)
                 return error_msg
 
         except Exception as e:
             print(f"图片分析失败: {str(e)}")
             print(f"异常类型: {type(e).__name__}")
-            error_msg = "图片分析失败，请重试"
-            self.show_result(error_msg)
+            error_msg = f"图片分析失败，请重试: {str(e)}"
+            self.show_result(error_msg, copy_to_clipboard=False)
             return error_msg
 
-    def _analyze_with_openai(self, image_path):
+    def _analyze_with_openai(self, image_path, chat_history_ref):
         """使用OpenAI API分析图片"""
         try:
             print("\n=== 使用OpenAI API ===")
@@ -662,148 +702,228 @@ class FloatingWindow:
             
             with open(image_path, "rb") as image_file:
                 print("正在读取图片并转换为base64...")
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                image_b64_data = base64.b64encode(image_file.read()).decode('utf-8')
                 
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {OPENAI_API_KEY}"
-                }
-                print("API请求头:", {k: v if k != 'Authorization' else '***' for k, v in headers.items()})
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}"
+            }
+            
+            # 构建messages
+            messages = [{"role": "system", "content": "You are a helpful AI assistant."}] # 基础系统提示
+            
+            # 添加历史记录
+            messages.extend(chat_history_ref)
+
+            # 当前用户输入
+            if not chat_history_ref: # 如果是新对话的第一轮
+                current_user_text = "You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one."
+            else:
+                current_user_text = "Here's another image related to our previous discussion. Please analyze it in that context."
+
+            current_user_message_content = [
+                {"type": "text", "text": current_user_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64_data}"}}
+            ]
+            messages.append({"role": "user", "content": current_user_message_content})
+            
+            print("正在准备发送API请求...")
+            print(f"请求URL: {OPENAI_API_BASE}/chat/completions")
+            print(f"使用模型: {OPENAI_MODEL}")
+            # ... (其他参数打印可以保留或移除)
+            
+            payload = {
+                "model": OPENAI_MODEL,
+                "messages": messages, # 使用构建好的messages
+                "temperature": OPENAI_TEMPERATURE,
+                "top_p": OPENAI_TOP_P,
+                "presence_penalty": OPENAI_PRESENCE_PENALTY,
+                "frequency_penalty": OPENAI_FREQUENCY_PENALTY
+            }
+            
+            if OPENAI_MODEL.startswith("o1-"):
+                payload["max_completion_tokens"] = OPENAI_MAX_TOKENS
+            else:
+                payload["max_tokens"] = OPENAI_MAX_TOKENS
+            
+            try:
+                print("发送API请求中...")
+                client = httpx.Client(
+                    verify=False,
+                    proxies={"http://": PROXY_URL, "https://": PROXY_URL} if PROXY_URL else None,
+                    timeout=30
+                )
+                response = client.post(f"{OPENAI_API_BASE}/chat/completions", headers=headers, json=payload)
                 
-                print("正在准备发送API请求...")
-                print(f"请求URL: {OPENAI_API_BASE}/chat/completions")
-                print(f"使用模型: {OPENAI_MODEL}")
-                print(f"参数配置:")
-                print(f"- 最大tokens: {OPENAI_MAX_TOKENS}")
-                print(f"- 温度: {OPENAI_TEMPERATURE}")
-                print(f"- top_p: {OPENAI_TOP_P}")
-                print(f"- presence_penalty: {OPENAI_PRESENCE_PENALTY}")
-                print(f"- frequency_penalty: {OPENAI_FREQUENCY_PENALTY}")
-                
-                # 基础payload
-                payload = {
-                    "model": OPENAI_MODEL,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_data}"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    "temperature": OPENAI_TEMPERATURE,
-                    "top_p": OPENAI_TOP_P,
-                    "presence_penalty": OPENAI_PRESENCE_PENALTY,
-                    "frequency_penalty": OPENAI_FREQUENCY_PENALTY
-                }
-                
-                # 根据模型类型添加不同的token限制参数
-                if OPENAI_MODEL.startswith("o1-"):
-                    payload["max_completion_tokens"] = OPENAI_MAX_TOKENS
+                print(f"API响应状态码: {response.status_code}")
+                if response.status_code == 200:
+                    result = response.json()
+                    response_text = result['choices'][0]['message']['content']
+                    print("分析结果:", response_text)
+                    self.show_result(response_text)
+
+                    # 更新历史记录
+                    # OpenAI user message content for history should match what was sent
+                    # For multimodal, content is a list. Let's store the b64 for potential reconstruction.
+                    chat_history_ref.append({
+                        "role": "user", 
+                        "content": [ # Store as list to be consistent
+                            {"type": "text", "text": current_user_text},
+                            {"type": "image_b64_custom", "b64data": image_b64_data} # Custom type for our history
+                        ]
+                    })
+                    chat_history_ref.append({"role": "assistant", "content": response_text})
+                    return response_text
                 else:
-                    payload["max_tokens"] = OPENAI_MAX_TOKENS
-                
-                try:
-                    print("发送API请求中...")
-                    client = httpx.Client(
-                        verify=False,
-                        proxies={
-                            "http://": PROXY_URL,
-                            "https://": PROXY_URL
-                        } if PROXY_URL else None,
-                        timeout=30
-                    )
-                    response = client.post(
-                        f"{OPENAI_API_BASE}/chat/completions",
-                        headers=headers,
-                        json=payload
-                    )
-                    
-                    print(f"API响应状态码: {response.status_code}")
-                    if response.status_code == 200:
-                        result = response.json()
-                        print("API请求成功！")
-                        print("API响应:", result)
-                        response_text = result['choices'][0]['message']['content']
-                        print("分析结果:", response_text)
-                        self.show_result(response_text)
-                        return response_text
-                    else:
-                        print(f"API请求失败: {response.status_code}")
-                        print("错误响应:", response.text)
-                        raise Exception(f"API请求失败: {response.status_code}")
+                    # ... (错误处理)
+                    print(f"API请求失败: {response.status_code}")
+                    print("错误响应:", response.text)
+                    # 尝试解析错误信息并显示
+                    try:
+                        error_data = response.json()
+                        error_message = error_data.get("error", {}).get("message", response.text)
+                        self.show_result(f"OpenAI API 错误: {error_message}", copy_to_clipboard=False)
+                    except:
+                        self.show_result(f"OpenAI API 请求失败: {response.status_code}", copy_to_clipboard=False)
+                    raise Exception(f"API请求失败: {response.status_code}")
                         
-                except Exception as e:
-                    print(f"API请求异常: {str(e)}")
-                    print(f"异常类型: {type(e).__name__}")
-                    if isinstance(e, httpx.TimeoutException):
-                        print("请求超时，可能是网络问题或代理设置有误")
-                    elif isinstance(e, httpx.ConnectError):
-                        print("连接错误，请检查网络连接和代理设置")
-                    raise
-                finally:
-                    client.close()
+            except Exception as e:
+                # ... (异常处理)
+                print(f"API请求异常: {str(e)}")
+                self.show_result(f"OpenAI API 连接错误: {str(e)}", copy_to_clipboard=False)
+                raise
+            finally:
+                client.close()
                     
         except Exception as e:
             print(f"OpenAI分析失败: {str(e)}")
-            print(f"异常类型: {type(e).__name__}")
+            self.show_result(f"OpenAI 分析处理失败: {str(e)}", copy_to_clipboard=False)
             raise
 
-    def _analyze_with_gemini(self, image_path):
-        """使用Gemini API分析图片（作为备用）"""
+    def _analyze_with_gemini(self, image_path, chat_history_ref):
+        """使用Gemini API分析图片"""
         try:
             print("\n=== 使用Gemini API ===")
             print("正在加载图片...")
-            image = Image.open(image_path)
+            pil_image = Image.open(image_path) # PIL Image object for the current turn
+
+            # 将我们通用的 chat_history_ref 转换为 Gemini 的 history 格式
+            gemini_converted_history = []
+            for msg in chat_history_ref:
+                gemini_role = "user" if msg["role"] == "user" else "model"
+                parts = []
+                if isinstance(msg["content"], str): # Assistant text or user-only text
+                    parts.append(msg["content"])
+                elif isinstance(msg["content"], list): # User multimodal from our history
+                    for item in msg["content"]:
+                        if item["type"] == "text":
+                            parts.append(item["text"])
+                        elif item["type"] == "image_b64_custom": # Image from previous turn
+                            try:
+                                image_bytes = base64.b64decode(item["b64data"])
+                                # 直接构造字典，而不是使用 Part.from_data()
+                                parts.append({'inline_data': {'mime_type': 'image/jpeg', 'data': image_bytes}})
+                            except Exception as e_b64:
+                                print(f"Error decoding/processing base64 image from history for Gemini: {e_b64}")
+                                parts.append("[Image from history could not be loaded]")
+                if parts: # Ensure parts is not empty
+                    gemini_converted_history.append({'role': gemini_role, 'parts': parts})
             
-            print("正在初始化Gemini模型...")
-            print(f"使用模型: {GEMINI_MODEL}")
-            print(f"参数配置:")
-            print(f"- 温度: {GEMINI_TEMPERATURE}")
-            print(f"- top_p: {GEMINI_TOP_P}")
-            print(f"- top_k: {GEMINI_TOP_K}")
-            print(f"- 最大输出tokens: {GEMINI_MAX_OUTPUT_TOKENS}")
+            print(f"转换后的Gemini历史条数: {len(gemini_converted_history)}")
+
+            # 初始化聊天会话
+            # self.model should already be initialized from setup_gemini
+            chat_session = self.model.start_chat(history=gemini_converted_history)
             
-            model = genai.GenerativeModel(
-                GEMINI_MODEL,
-                generation_config={
-                    "temperature": GEMINI_TEMPERATURE,
-                    "top_p": GEMINI_TOP_P,
-                    "top_k": GEMINI_TOP_K,
-                    "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
-                }
-            )
+            print("正在初始化Gemini模型 (聊天会话)...")
+            print(f"使用模型: {GEMINI_MODEL}") # GEMINI_MODEL is env var, self.model.model_name is actual
             
-            print("发送Gemini API请求...")
-            response = model.generate_content(["You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one.", image])
-            
-            # 根据模型类型处理响应
-            if GEMINI_MODEL == "gemini-2.0-flash-thinking-exp-1219":
-                result = response.candidates[0].content.parts[1].text
+            # 当前用户输入
+            if not chat_history_ref: # 如果是新对话的第一轮
+                current_user_text_prompt = "You hold a Ph.D. in computer networking, and your task is to analyze the questions I will provide. These questions will include multiple-choice and matching types. Please understand the content of the questions and directly provide the answers to each one."
             else:
-                result = response.text
-                
-            print("Gemini分析结果:", result)
-            self.show_result(result)
-            return result
+                current_user_text_prompt = "Here's another image related to our previous discussion. Please analyze it in that context."
+
+            current_user_prompt_parts = [current_user_text_prompt, pil_image] # Text and current PIL Image
+
+            print("发送Gemini API请求 (聊天模式)...")
+            response = chat_session.send_message(current_user_prompt_parts)
+            
+            response_text = ""
+            # 检查 response.candidates 是否存在以及是否有内容
+            if response.candidates and len(response.candidates) > 0:
+                # 检查 part 是否存在以及是否有内容
+                if response.candidates[0].content.parts and len(response.candidates[0].content.parts) > 0:
+                    # 根据 Gemini 返回的 Part 类型提取文本
+                    # 通常文本在第一个 part，但也可能分散或在特定模型的特定 part
+                    # 简单起见，我们连接所有 text parts
+                    for part in response.candidates[0].content.parts:
+                        if hasattr(part, 'text'):
+                             response_text += part.text
+                        elif hasattr(part, 'inline_data'): # 有时 Gemini 可能返回 inline_data 代替 text
+                             print("[WARN] Gemini returned inline_data instead of text, attempting to decode if it's text.")
+                             # This is a fallback, usually text should be in 'text' attribute
+                             try:
+                                 response_text += part.inline_data.data.decode()
+                             except:
+                                 print("[ERROR] Could not decode inline_data from Gemini.")
+                else:
+                    print("[WARN] Gemini response.candidates[0].content.parts is empty.")
+                    # 尝试从 response.text (如果存在) 获取，作为备用
+                    if hasattr(response, 'text'):
+                        response_text = response.text
+                    else:
+                        response_text = "Gemini响应为空或格式无法解析。"
+            else:
+                print("[WARN] Gemini response.candidates is empty.")
+                # 尝试从 response.text (如果存在) 获取
+                if hasattr(response, 'text'):
+                    response_text = response.text
+                else:
+                    response_text = "Gemini未能生成有效响应。"
+            
+            print("Gemini分析结果:", response_text)
+            self.show_result(response_text)
+
+            # 更新聊天历史 (self.chat_history 是我们主程序的历史记录)
+            # chat_session.history 是 Gemini SDK 内部维护的，我们需要同步
+            # 我们将 Gemini 返回的 history (已经是正确格式) 更新到 self.chat_history
+            # 但为了保持我们自定义的 'image_b64_custom' 格式，我们需要手动添加当前回合
+            
+            # 1. 添加当前用户的输入到 chat_history_ref (我们的主历史)
+            # 为了能重建Gemini历史，最好还是存b64
+            with open(image_path, "rb") as image_file:
+                image_b64_data_for_history = base64.b64encode(image_file.read()).decode('utf-8')
+
+            chat_history_ref.append({
+                "role": "user",
+                "content": [ # Store as list
+                    {"type": "text", "text": current_user_text_prompt},
+                    {"type": "image_b64_custom", "b64data": image_b64_data_for_history}
+                ]
+            })
+            # 2. 添加模型的回复到 chat_history_ref
+            chat_history_ref.append({"role": "assistant", "content": response_text})
+            
+            # 验证 chat_session.history 是否与我们的 chat_history_ref 相似 (可选调试)
+            # print(f"Gemini SDK history length: {len(chat_session.history)}")
+            # print(f"Our app history length: {len(chat_history_ref)}")
+
+            return response_text
         except Exception as e:
             print(f"Gemini分析失败: {str(e)}")
             print(f"异常类型: {type(e).__name__}")
-            error_msg = "图片分析失败，请重试"
-            self.show_result(error_msg)
+            import traceback
+            print(traceback.format_exc())
+            error_msg = f"Gemini分析失败: {str(e)}"
+            self.show_result(error_msg, copy_to_clipboard=False)
             return error_msg
 
     def run(self):
-        print("程序已启动！使用Ctrl+Shift+Q截图，Ctrl+C退出")
+        print("程序已启动！")
+        print("  Ctrl+Shift+Q: 截图并开始新提问 (清除历史)")
+        print("  Ctrl+Shift+A: 截图并继续当前提问 (保留历史)")
+        print("  Ctrl+C: 退出程序")
         try:
             self.root.mainloop()
         except Exception as e:
@@ -814,6 +934,7 @@ class FloatingWindow:
 
     def setup_hotkey(self):
         keyboard.add_hotkey('ctrl+shift+q', self.take_screenshot)
+        keyboard.add_hotkey('ctrl+shift+a', self.take_screenshot_with_history) # 新增快捷键
         keyboard.add_hotkey('ctrl+c', self.quit_app)
 
     def setup_window(self):
