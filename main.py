@@ -572,54 +572,14 @@ class FloatingWindow:
             self.cancel_auto_hide()
 
     def show_result(self, text):
-        # 更新标签文本
-        self.label.configure(text=text)
-        
-        # 获取真实的屏幕尺寸（考虑DPI缩放）
         try:
-            user32 = ctypes.windll.user32
-            user32.SetProcessDPIAware()
-            screen_width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
-            screen_height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
-            
-            # 获取工作区（考虑任务栏）
-            monitor = win32api.EnumDisplayMonitors(None, None)[0][0]
-            monitor_info = win32api.GetMonitorInfo(monitor)
-            work_area = monitor_info['Work']
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()  # 确保剪贴板内容已更新
+            print(f"已复制到剪贴板: {text}")
         except Exception as e:
-            print(f"[DEBUG] Error getting screen metrics: {e}")
-            screen_width = self.root.winfo_screenwidth()
-            screen_height = self.root.winfo_screenheight()
-            work_area = [0, 0, screen_width, screen_height - 40]
-        
-        # 计算位置（左下角，使用工作区）
-        x = work_area[0] + 20
-        y = work_area[3] - self.popup.winfo_reqheight() - 20
-        
-        # 设置弹窗位置
-        self.popup.geometry(f"+{x}+{y}")  # 只设置位置，不设置大小
-        
-        # 实现淡入效果
-        self.popup.attributes('-alpha', 0.0)
-        self.popup.deiconify()
-        
-        # 更新滚动区域
-        self.content_frame.update_idletasks()
-        self._on_frame_configure()
-        
-        # 滚动到底部
-        self.popup.after(10, lambda: self.canvas.yview_moveto(1.0))
-        
-        # 淡入动画
-        def fade_in(alpha=0.0):
-            alpha += 0.1
-            if alpha <= 0.70:
-                self.popup.attributes('-alpha', alpha)
-                self.popup.after(20, lambda: fade_in(alpha))
-            else:
-                self.popup.attributes('-alpha', 0.70)
-                
-        fade_in()
+            print(f"复制到剪贴板失败: {e}")
+            print(f"原始文本: {text}")
         
     def take_screenshot(self):
         if self.is_processing:
