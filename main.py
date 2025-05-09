@@ -360,9 +360,6 @@ class FloatingWindow:
             "GEMINI_MODEL": GEMINI_MODEL
         }
         
-        # 设置系统托盘
-        self.setup_tray()
-        
         # 直接加载模型
         threading.Thread(target=self.setup_gemini, daemon=True).start()
 
