@@ -23,6 +23,7 @@ import json
 from io import BytesIO
 import base64
 from pystray import Icon as TrayIcon, Menu as TrayMenu, MenuItem as TrayMenuItem
+import pyperclip
 
 # 加载环境变量
 load_dotenv()
@@ -573,12 +574,22 @@ class FloatingWindow:
 
     def show_result(self, text):
         try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update()  # 确保剪贴板内容已更新
-            print(f"已复制到剪贴板: {text}")
-        except Exception as e:
-            print(f"复制到剪贴板失败: {e}")
+            pyperclip.copy(text)
+            print(f"已使用 pyperclip 复制到剪贴板: {text}")
+        except pyperclip.PyperclipException as e_pyperclip:
+            print(f"使用 pyperclip 复制到剪贴板失败: {e_pyperclip}")
+            print("请确保您已安装 xclip 或 xsel (Linux) 或正确配置剪贴板。")
+            print("尝试使用 Tkinter 的剪贴板功能作为后备。")
+            try: 
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update()
+                print(f"已使用 Tkinter 复制到剪贴板: {text}")
+            except Exception as e_tk:
+                print(f"使用 Tkinter 复制到剪贴板失败: {e_tk}")
+                print(f"原始文本: {text}")
+        except Exception as e: # 其他未知错误
+            print(f"复制到剪贴板时发生未知错误: {e}")
             print(f"原始文本: {text}")
         
     def take_screenshot(self):
