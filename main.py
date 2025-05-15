@@ -25,6 +25,7 @@ from io import BytesIO
 import base64
 from pystray import Icon as TrayIcon, Menu as TrayMenu, MenuItem as TrayMenuItem
 import pyperclip
+import atexit # 新增导入
 
 # 加载环境变量
 load_dotenv()
@@ -348,6 +349,73 @@ class FloatingWindow:
         self.is_processing = False  # 添加处理状态标志
         self.chat_history = [] # 新增：存储聊天历史
         self.current_analysis_is_new_task = True # 新增：标记是否为新任务
+
+        # Cursor Hacking
+        self.cursor_change_enabled = False
+        self._h_prototype_arrow = None
+        self._h_prototype_appstarting = None
+        self.SetSystemCursor_func = None
+        self.SystemParametersInfoW_func = None
+        self.cursor_restored_at_exit = False # Flag to ensure restore is called once effectively by atexit/finally
+        self.is_quitting = False # Flag to prevent issues during shutdown
+
+        try:
+            user32 = ctypes.windll.user32
+            self.IDC_ARROW_CONST = win32con.IDC_ARROW
+            self.IDC_APPSTARTING_CONST = win32con.IDC_APPSTARTING
+
+            # Step 1: Load cursor prototypes using pywin32
+            self._h_prototype_arrow = win32gui.LoadCursor(0, self.IDC_ARROW_CONST)
+            self._h_prototype_appstarting = win32gui.LoadCursor(0, self.IDC_APPSTARTING_CONST)
+
+            if not self._h_prototype_arrow or not self._h_prototype_appstarting:
+                print("[ERROR] Hybrid: Failed to load system cursor prototypes via pywin32. Cursor change disabled.")
+                raise Exception("Failed to load pywin32 cursor prototypes")
+            else:
+                print("[INFO] Hybrid: Cursor prototypes loaded successfully via pywin32.")
+
+            # Step 2: Get SetSystemCursor function pointer using ctypes
+            try:
+                # BOOL SetSystemCursor(HCURSOR hcur, DWORD id);
+                SetSystemCursor_proto = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_uint)
+                self.SetSystemCursor_func = SetSystemCursor_proto(("SetSystemCursor", user32))
+                print("[INFO] Hybrid: SetSystemCursor function pointer obtained via ctypes.")
+            except AttributeError as e_ctypes_attr:
+                print(f"[ERROR] Hybrid: ctypes AttributeError for SetSystemCursor (not found): {e_ctypes_attr}. Cursor change disabled.")
+                raise # Re-raise to be caught by outer try-except
+            except Exception as e_ctypes_gen:
+                print(f"[ERROR] Hybrid: ctypes general error for SetSystemCursor: {e_ctypes_gen}. Cursor change disabled.")
+                raise # Re-raise
+            
+            # Step 3: Get SystemParametersInfoW function pointer using ctypes
+            try:
+                SystemParametersInfoW_proto = ctypes.WINFUNCTYPE(
+                    ctypes.c_bool, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint
+                )
+                self.SystemParametersInfoW_func = SystemParametersInfoW_proto(("SystemParametersInfoW", user32))
+                print("[INFO] Hybrid: SystemParametersInfoW function pointer obtained via ctypes.")
+            except AttributeError as e_ctypes_spi_attr:
+                print(f"[WARNING] Hybrid: ctypes AttributeError for SystemParametersInfoW (not found): {e_ctypes_spi_attr}. SPI_SETCURSORS fallback might not work.")
+                self.SystemParametersInfoW_func = None # Ensure it's None if not found
+            except Exception as e_ctypes_spi_gen:
+                print(f"[WARNING] Hybrid: ctypes general error for SystemParametersInfoW: {e_ctypes_spi_gen}. SPI_SETCURSORS fallback might not work.")
+                self.SystemParametersInfoW_func = None # Ensure it's None
+
+            # Enable cursor change if SetSystemCursor (primary mechanism) is available
+            if self.SetSystemCursor_func:
+                self.cursor_change_enabled = True
+                print("[INFO] Hybrid: Cursor change enabled (pywin32 Load/Copy + ctypes SetSystemCursor).")
+                atexit.register(self.ensure_restore_at_exit) # Register a wrapper for atexit
+                print("[INFO] Hybrid: ensure_restore_at_exit registered with atexit.")
+            else:
+                print("[ERROR] Hybrid: SetSystemCursor_func not loaded, cursor change will be disabled.")
+
+
+        except win32api.error as e_pywin:
+            print(f"[ERROR] Hybrid: PyWin32 error during cursor initialization: {e_pywin}. Cursor change disabled.")
+        except Exception as e_overall:
+            # This will catch re-raised exceptions from ctypes block or other general errors
+            print(f"[ERROR] Hybrid: Overall error during cursor setup: {e_overall}. Cursor change disabled.")
         
         # 先创建窗口
         self.setup_window()
@@ -484,21 +552,43 @@ class FloatingWindow:
 
     def quit_app(self, icon=None):
         """退出应用"""
-        if hasattr(self, 'tray_icon'):
-            self.tray_icon.stop()
-        # 取消注册所有快捷键
+        if self.is_quitting:
+            print("[INFO] quit_app: Already in quitting process, skipping.")
+            return
+        self.is_quitting = True
+        print("[INFO] quit_app: Initiating application quit sequence.")
+
+        if hasattr(self, 'tray_icon') and self.tray_icon:
+            print("[INFO] quit_app: Stopping tray icon...")
+            try:
+                self.tray_icon.stop()
+            except Exception as e_tray:
+                print(f"[WARNING] quit_app: Error stopping tray icon: {e_tray}")
+        
+        print("[INFO] quit_app: Unhooking all keyboard hotkeys...")
         keyboard.unhook_all()
-        # 还原环境变量
-        os.environ["MODEL_PROVIDER"] = self.original_env["MODEL_PROVIDER"]
-        os.environ["OPENAI_MODEL"] = self.original_env["OPENAI_MODEL"]
-        os.environ["GEMINI_MODEL"] = self.original_env["GEMINI_MODEL"]
-        # 销毁所有窗口
-        if hasattr(self, 'popup') and self.popup:
-            self.popup.destroy()
-        if hasattr(self, 'root') and self.root:
-            self.root.destroy()
-        # 强制退出
-        os._exit(0)
+        
+        # Restore environment variables (optional, good practice if they were changed)
+        # os.environ["MODEL_PROVIDER"] = self.original_env["MODEL_PROVIDER"]
+        # os.environ["OPENAI_MODEL"] = self.original_env["OPENAI_MODEL"]
+        # os.environ["GEMINI_MODEL"] = self.original_env["GEMINI_MODEL"]
+        # print("[INFO] quit_app: Restored environment variables.")
+
+        # Attempt to restore cursor explicitly before Tkinter teardown
+        # This is a safety net in case atexit doesn't fire as expected or is too late.
+        if self.cursor_change_enabled and not self.cursor_restored_at_exit:
+             print("[INFO] quit_app: Explicitly calling ensure_restore_at_exit before Tkinter destroy.")
+             self.ensure_restore_at_exit()
+
+        if hasattr(self, 'root') and self.root.winfo_exists():
+            print("[INFO] quit_app: Requesting Tkinter root window to destroy...")
+            self.root.destroy() # Request Tkinter to shut down its main loop and windows
+        else:
+            print("[INFO] quit_app: Tkinter root window does not exist or already destroyed.")
+            
+        # sys.exit(0) # Use sys.exit for a cleaner shutdown that allows atexit to run
+                      # Removed os._exit(0)
+        print("[INFO] quit_app: Quit sequence initiated. Waiting for main loop to terminate if not already.")
 
     def clear_chat_history(self):
         """清空聊天历史"""
@@ -669,19 +759,20 @@ class FloatingWindow:
 
     def analyze_image(self, image_path, chat_history_to_use):
         """分析图片内容"""
+        self.set_wait_cursor() # Set cursor at the beginning
         try:
             print("\n=== 开始分析图片 ===")
-            print(f"使用模型提供商: {MODEL_PROVIDER}")
+            print(f"使用模型提供商: {self.current_model_provider}") # Use self.current_model_provider
             print(f"是否为新任务: {self.current_analysis_is_new_task}")
             print(f"当前历史记录条数: {len(chat_history_to_use)}")
             
             # 根据配置选择使用哪个模型
-            if MODEL_PROVIDER == "openai":
+            if self.current_model_provider == "openai":
                 return self._analyze_with_openai(image_path, chat_history_to_use)
-            elif MODEL_PROVIDER == "gemini":
+            elif self.current_model_provider == "gemini":
                 return self._analyze_with_gemini(image_path, chat_history_to_use)
             else:
-                error_msg = f"未知的模型提供商: {MODEL_PROVIDER}，请在 .env 文件中设置 MODEL_PROVIDER 为 'openai' 或 'gemini'"
+                error_msg = f"未知的模型提供商: {self.current_model_provider}，请在 .env 文件中设置 MODEL_PROVIDER 为 'openai' 或 'gemini'"
                 print(error_msg)
                 self.show_result(error_msg, copy_to_clipboard=False)
                 return error_msg
@@ -691,7 +782,12 @@ class FloatingWindow:
             print(f"异常类型: {type(e).__name__}")
             error_msg = f"图片分析失败，请重试: {str(e)}"
             self.show_result(error_msg, copy_to_clipboard=False)
-            return error_msg
+            # Ensure we return something from this path too
+            return error_msg # Added return
+        finally:
+            print("[DEBUG] Entering analyze_image finally block.")
+            self.restore_default_cursor() # Restore cursor in finally block
+            print("[DEBUG] Exiting analyze_image finally block.")
 
     def _analyze_with_openai(self, image_path, chat_history_ref):
         """使用OpenAI API分析图片"""
@@ -919,6 +1015,107 @@ class FloatingWindow:
             self.show_result(error_msg, copy_to_clipboard=False)
             return error_msg
 
+    def set_wait_cursor(self):
+        if not self.cursor_change_enabled or not self.SetSystemCursor_func:
+            print("[DEBUG] Hybrid: Cursor change is disabled or SetSystemCursor_func is missing, skipping set_wait_cursor.")
+            return
+        try:
+            # Step 1: Copy cursor using pywin32 (seems to work)
+            h_appstarting_copy = win32gui.CopyIcon(self._h_prototype_appstarting)
+            if not h_appstarting_copy:
+                lasterror = win32api.GetLastError()
+                print(f"[ERROR] Hybrid (pywin32): CopyIcon failed for appstarting cursor. Error: {lasterror} - {win32api.FormatMessage(lasterror).strip()}")
+                return
+
+            # Step 2: Set system cursor using ctypes function pointer
+            if not self.SetSystemCursor_func(ctypes.c_void_p(h_appstarting_copy), self.IDC_ARROW_CONST):
+                # For ctypes calls, GetLastError is usually from ctypes.WinError or ctypes.get_last_error()
+                # However, since we are in a mixed environment, win32api.GetLastError might still be relevant
+                # if SetSystemCursor itself sets the error that pywin32 can read.
+                # For more specific ctypes error, one would typically use ctypes.get_last_error() if the function was set up with use_last_error=True.
+                # Here, we just report a generic failure.
+                print(f"[ERROR] Hybrid (ctypes): SetSystemCursor failed to set wait cursor. Windows LastError: {win32api.GetLastError()}")
+            else:
+                print("Hybrid: Set global cursor to wait.")
+                # Potentially mark that a non-default cursor is active if needed for complex state tracking
+                # For now, restore_default_cursor handles restoring regardless of current state if enabled
+
+        except win32api.error as e_pywin:
+            print(f"Hybrid: PyWin32 error setting wait cursor: {e_pywin}")
+        except Exception as e_gen:
+            print(f"Hybrid: Generic error setting wait cursor: {e_gen}")
+
+    def restore_default_cursor(self, is_exit_call=False):
+        if not self.cursor_change_enabled:
+            print("[DEBUG] Hybrid: Cursor change is disabled, skipping restore_default_cursor.")
+            return
+
+        # If this is an exit call and already handled, skip
+        if is_exit_call and self.cursor_restored_at_exit:
+            # This check is a bit redundant if ensure_restore_at_exit works, but good for direct calls
+            print("[DEBUG] restore_default_cursor (exit_call): Already flagged as restored, skipping.")
+            return
+        
+        print(f"[INFO] Attempting to restore default cursor (is_exit_call={is_exit_call})...")
+
+        restored_by_setsystemcursor = False
+        h_arrow_copy_local = 0 # Initialize local copy handle
+
+        if self.SetSystemCursor_func and self._h_prototype_arrow:
+            try:
+                h_arrow_copy_local = win32gui.CopyIcon(self._h_prototype_arrow)
+                if not h_arrow_copy_local:
+                    lasterror = win32api.GetLastError()
+                    print(f"[ERROR] Hybrid (pywin32): CopyIcon failed for arrow cursor (restore). Error: {lasterror} - {win32api.FormatMessage(lasterror).strip()}")
+                else:
+                    if self.SetSystemCursor_func(ctypes.c_void_p(h_arrow_copy_local), self.IDC_ARROW_CONST):
+                        print("Hybrid (ctypes): SetSystemCursor reported success for restoring default.")
+                        restored_by_setsystemcursor = True
+                    else:
+                        print(f"[ERROR] Hybrid (ctypes): SetSystemCursor failed to restore cursor. Windows LastError: {win32api.GetLastError()}")
+            
+            except win32api.error as e_pywin_restore:
+                print(f"Hybrid: PyWin32 error during SetSystemCursor part of restore: {e_pywin_restore}")
+            except Exception as e_gen_ssc_restore:
+                print(f"Hybrid: Generic error during SetSystemCursor part of restore: {e_gen_ssc_restore}")
+            finally:
+                if h_arrow_copy_local: # Destroy the local copy if it was created
+                    try:
+                        win32gui.DestroyIcon(h_arrow_copy_local)
+                        print("[DEBUG] Hybrid: Destroyed local copied arrow cursor handle.")
+                    except Exception as e_destroy:
+                        print(f"[WARNING] Hybrid: Failed to destroy local copied arrow cursor handle: {e_destroy}")
+        else:
+            print("[DEBUG] Hybrid: SetSystemCursor_func or _h_prototype_arrow missing, cannot use SetSystemCursor for restore.")
+
+        if self.SystemParametersInfoW_func:
+            try:
+                print("[INFO] Calling SystemParametersInfoW with SPI_SETCURSORS via ctypes to reset all system cursors.")
+                # Parameters: uiAction, uiParam, pvParam, fWinIni
+                # For SPI_SETCURSORS: uiAction = win32con.SPI_SETCURSORS, uiParam = 0, pvParam = NULL (0), fWinIni = 0
+                success_spi = self.SystemParametersInfoW_func(win32con.SPI_SETCURSORS, 0, ctypes.c_void_p(0), 0)
+                if success_spi: # Returns non-zero for success
+                    print("[INFO] ctypes SystemParametersInfoW(SPI_SETCURSORS) call reported success.")
+                else:
+                    lasterror_spi = win32api.GetLastError() 
+                    print(f"[ERROR] ctypes SystemParametersInfoW(SPI_SETCURSORS) call failed. Windows LastError: {lasterror_spi} - {win32api.FormatMessage(lasterror_spi).strip()}")
+            except Exception as e_gen_spi_ctypes:
+                print(f"[ERROR] Generic error during ctypes SystemParametersInfoW(SPI_SETCURSORS) call: {e_gen_spi_ctypes}")
+        else:
+            print("[DEBUG] SystemParametersInfoW_func (ctypes) not available, cannot use it for SPI_SETCURSORS fallback.")
+        
+        if is_exit_call:
+            self.cursor_restored_at_exit = True # Mark as done if called during exit sequence
+
+    def ensure_restore_at_exit(self):
+        """Ensures restore_default_cursor is called once effectively on exit."""
+        if not self.cursor_restored_at_exit:
+            print("[INFO] ensure_restore_at_exit: Calling restore_default_cursor.")
+            self.restore_default_cursor(is_exit_call=True)
+            self.cursor_restored_at_exit = True
+        else:
+            print("[INFO] ensure_restore_at_exit: Cursor already flagged as restored.")
+
     def run(self):
         print("程序已启动！")
         print("  Ctrl+Shift+Q: 截图并开始新提问 (清除历史)")
@@ -1068,7 +1265,28 @@ if __name__ == '__main__':
     try:
         app.run()
     except KeyboardInterrupt:
-        app.quit_app()
+        print("程序被用户中断 (KeyboardInterrupt)")
+    except SystemExit as e:
+        print(f"程序退出 (SystemExit: {e})")
     except Exception as e:
-        print(f"程序异常退出: {e}")
-        os._exit(1)
+        print(f"主程序发生未捕获异常: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("程序即将退出，执行最终清理...")
+        if hasattr(app, 'cursor_change_enabled') and app.cursor_change_enabled:
+            if hasattr(app, 'ensure_restore_at_exit') and callable(app.ensure_restore_at_exit):
+                print("主程序 finally 块: 尝试通过 ensure_restore_at_exit 恢复光标...")
+                app.ensure_restore_at_exit()
+            else:
+                print("主程序 finally 块: app.ensure_restore_at_exit 不可用。")
+        else:
+            print("主程序 finally 块: 光标更改功能未启用或 app 对象异常。")
+        
+        # If app.quit_app() was called, it might have already initiated Tkinter shutdown.
+        # If mainloop exited due to error, Tk might still need to be explicitly told to quit.
+        # However, calling quit_app again here if it uses sys.exit can be problematic.
+        # The main goal is to ensure Tkinter exits gracefully and atexit runs.
+        # The ensure_restore_at_exit via atexit and the explicit call in quit_app should cover cursor.
+
+        print("程序最终清理完成。")
