@@ -1019,47 +1019,49 @@ class FloatingWindow:
         if not self.cursor_change_enabled or not self.SetSystemCursor_func:
             print("[DEBUG] Hybrid: Cursor change is disabled or SetSystemCursor_func is missing, skipping set_wait_cursor.")
             return
+        
+        h_appstarting_copy = 0  # Initialize
+        wait_cursor_successfully_set = False # Flag to track if SetSystemCursor succeeded
         try:
-            # Step 1: Copy cursor using pywin32 (seems to work)
             h_appstarting_copy = win32gui.CopyIcon(self._h_prototype_appstarting)
             if not h_appstarting_copy:
                 lasterror = win32api.GetLastError()
                 print(f"[ERROR] Hybrid (pywin32): CopyIcon failed for appstarting cursor. Error: {lasterror} - {win32api.FormatMessage(lasterror).strip()}")
                 return
 
-            # Step 2: Set system cursor using ctypes function pointer
-            if not self.SetSystemCursor_func(ctypes.c_void_p(h_appstarting_copy), self.IDC_ARROW_CONST):
-                # For ctypes calls, GetLastError is usually from ctypes.WinError or ctypes.get_last_error()
-                # However, since we are in a mixed environment, win32api.GetLastError might still be relevant
-                # if SetSystemCursor itself sets the error that pywin32 can read.
-                # For more specific ctypes error, one would typically use ctypes.get_last_error() if the function was set up with use_last_error=True.
-                # Here, we just report a generic failure.
-                print(f"[ERROR] Hybrid (ctypes): SetSystemCursor failed to set wait cursor. Windows LastError: {win32api.GetLastError()}")
-            else:
+            if self.SetSystemCursor_func(ctypes.c_void_p(h_appstarting_copy), self.IDC_ARROW_CONST):
                 print("Hybrid: Set global cursor to wait.")
-                # Potentially mark that a non-default cursor is active if needed for complex state tracking
-                # For now, restore_default_cursor handles restoring regardless of current state if enabled
+                wait_cursor_successfully_set = True # System now owns and will destroy h_appstarting_copy
+            else:
+                print(f"[ERROR] Hybrid (ctypes): SetSystemCursor failed to set wait cursor. Windows LastError: {win32api.GetLastError()}")
+                # We still own h_appstarting_copy and must destroy it if it's valid and CopyIcon succeeded
 
         except win32api.error as e_pywin:
             print(f"Hybrid: PyWin32 error setting wait cursor: {e_pywin}")
         except Exception as e_gen:
             print(f"Hybrid: Generic error setting wait cursor: {e_gen}")
+        finally:
+            if h_appstarting_copy and not wait_cursor_successfully_set:
+                # Only destroy if CopyIcon succeeded AND SetSystemCursor did not take ownership
+                try:
+                    win32gui.DestroyIcon(h_appstarting_copy)
+                    print("[DEBUG] Hybrid: Destroyed copied appstarting cursor in finally (because SetSystemCursor failed or was not called successfully).")
+                except Exception as e_destroy_wait:
+                    print(f"[WARNING] Hybrid: Failed to destroy copied appstarting cursor handle in finally: {e_destroy_wait}")
 
     def restore_default_cursor(self, is_exit_call=False):
         if not self.cursor_change_enabled:
             print("[DEBUG] Hybrid: Cursor change is disabled, skipping restore_default_cursor.")
             return
 
-        # If this is an exit call and already handled, skip
         if is_exit_call and self.cursor_restored_at_exit:
-            # This check is a bit redundant if ensure_restore_at_exit works, but good for direct calls
             print("[DEBUG] restore_default_cursor (exit_call): Already flagged as restored, skipping.")
             return
         
         print(f"[INFO] Attempting to restore default cursor (is_exit_call={is_exit_call})...")
 
         restored_by_setsystemcursor = False
-        h_arrow_copy_local = 0 # Initialize local copy handle
+        h_arrow_copy_local = 0
 
         if self.SetSystemCursor_func and self._h_prototype_arrow:
             try:
@@ -1070,21 +1072,23 @@ class FloatingWindow:
                 else:
                     if self.SetSystemCursor_func(ctypes.c_void_p(h_arrow_copy_local), self.IDC_ARROW_CONST):
                         print("Hybrid (ctypes): SetSystemCursor reported success for restoring default.")
-                        restored_by_setsystemcursor = True
+                        restored_by_setsystemcursor = True # System now owns and will destroy h_arrow_copy_local
                     else:
                         print(f"[ERROR] Hybrid (ctypes): SetSystemCursor failed to restore cursor. Windows LastError: {win32api.GetLastError()}")
+                        # We still own h_arrow_copy_local
             
             except win32api.error as e_pywin_restore:
                 print(f"Hybrid: PyWin32 error during SetSystemCursor part of restore: {e_pywin_restore}")
             except Exception as e_gen_ssc_restore:
                 print(f"Hybrid: Generic error during SetSystemCursor part of restore: {e_gen_ssc_restore}")
             finally:
-                if h_arrow_copy_local: # Destroy the local copy if it was created
+                if h_arrow_copy_local and not restored_by_setsystemcursor:
+                    # Only destroy if CopyIcon succeeded AND SetSystemCursor did not take ownership
                     try:
                         win32gui.DestroyIcon(h_arrow_copy_local)
-                        print("[DEBUG] Hybrid: Destroyed local copied arrow cursor handle.")
+                        print("[DEBUG] Hybrid: Destroyed local copied arrow cursor handle in finally (because SetSystemCursor failed or was not called successfully).")
                     except Exception as e_destroy:
-                        print(f"[WARNING] Hybrid: Failed to destroy local copied arrow cursor handle: {e_destroy}")
+                        print(f"[WARNING] Hybrid: Failed to destroy local copied arrow cursor handle in finally: {e_destroy}")
         else:
             print("[DEBUG] Hybrid: SetSystemCursor_func or _h_prototype_arrow missing, cannot use SetSystemCursor for restore.")
 
